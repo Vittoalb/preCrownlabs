@@ -1,0 +1,14 @@
+apiVersion: net.super.dev/v1alpha1
+kind: PublicServiceInstance
+metadata:
+  name: example-service
+  namespace: ns1
+spec:
+  serviceName: myservice1
+  namespace: ns1
+  selector:
+    app: unified
+    component: app1
+  port: 80
+  targetPort: 80
+  externalIP: 172.18.0.240
