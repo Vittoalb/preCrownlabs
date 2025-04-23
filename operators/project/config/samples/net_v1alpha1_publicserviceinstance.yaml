@@ -1,9 +1,0 @@
-apiVersion: net.cloudprog.polito.it/v1alpha1
-kind: PublicServiceInstance
-metadata:
-  labels:
-    app.kubernetes.io/name: project
-    app.kubernetes.io/managed-by: kustomize
-  name: publicserviceinstance-sample
-spec:
-  # TODO(user): Add fields here

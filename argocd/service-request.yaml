@@ -1,0 +1,23 @@
+apiVersion: networking.example.com/v1alpha1
+kind: ServiceRequest
+metadata:
+  name: myservice-request
+spec:
+  namespace: ns1
+  app: unified
+  component: app1
+  targetPort: 8080
+  allowSharedIP: true
+
+---
+
+apiVersion: networking.example.com/v1alpha1
+kind: ServiceRequest
+metadata:
+  name: myservice-request-app2
+spec:
+  namespace: ns1
+  app: unified
+  component: app2
+  targetPort: 8081
+  allowSharedIP: true
