@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -36,6 +37,18 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
+	// Recupera la VirtualMachine associata
+	vm := &kubevirtv1.VirtualMachine{}
+	err = r.Get(ctx, req.NamespacedName, vm)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			log.Info("VirtualMachine non trovata, potrebbe essere stata eliminata", "Name", req.Name, "Namespace", req.Namespace)
+			return ctrl.Result{}, nil
+		}
+		log.Error(err, "Errore nel recupero della VirtualMachine", "Name", req.Name, "Namespace", req.Namespace)
+		return ctrl.Result{}, err
+	}
+
 	// Controlla se il servizio è già stato creato
 	if serviceRequest.Status.Status == "Created" {
 		log.Info("Il servizio è già stato creato", "Name", serviceRequest.Name, "Namespace", serviceRequest.Spec.Namespace)
@@ -45,37 +58,31 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Assegna una porta casuale
 	rand.Seed(time.Now().UnixNano())
 	assignedPort := rand.Intn(10000) + 30000 // Porta tra 30000 e 40000
-	log.Info("Porta assegnata al servizio", "AssignedPort", assignedPort)
+	log.Info("Porta assegnata alla VM", "AssignedPort", assignedPort)
 
 	// Crea il servizio Kubernetes
 	service := &corev1.Service{
 		ObjectMeta: ctrl.ObjectMeta{
-			Name:      fmt.Sprintf("service-%s", serviceRequest.Name),
-			Namespace: serviceRequest.Spec.Namespace,
+			Name:      "service-fedora-nginx",
+			Namespace: "ns1",
 			Annotations: map[string]string{
-				"metallb.universe.tf/address-pool": "my-ip-pool",
+				"metallb.universe.tf/address-pool":    "my-ip-pool",
+				"metallb.universe.tf/allow-shared-ip": "true",
 			},
 		},
 		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeLoadBalancer,
+			Selector: map[string]string{
+				"kubevirt.io/domain": "fedora-nginx",
+			},
 			Ports: []corev1.ServicePort{
 				{
-					Name:       "http",
 					Protocol:   corev1.ProtocolTCP,
-					Port:       int32(assignedPort),
-					TargetPort: intstr.FromInt(serviceRequest.Spec.TargetPort), // Usa il valore specificato
+					Port:       int32(assignedPort), // Porta assegnata dal controller
+					TargetPort: intstr.FromInt(22),  // Porta interna della VM
 				},
 			},
-			Selector: map[string]string{
-				"app":       serviceRequest.Spec.App,
-				"component": serviceRequest.Spec.Component,
-			},
-			Type: corev1.ServiceTypeLoadBalancer,
 		},
-	}
-
-	// Aggiungi l'annotazione per l'IP sharing se allowSharedIP è true
-	if serviceRequest.Spec.AllowSharedIP {
-		service.Annotations["metallb.universe.tf/allow-shared-ip"] = "true"
 	}
 
 	err = r.Create(ctx, service)
@@ -94,6 +101,17 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 	log.Info("Stato della ServiceRequest aggiornato con successo", "Name", serviceRequest.Name, "Namespace", serviceRequest.Spec.Namespace, "AssignedPort", assignedPort)
+
+	// Aggiorna lo stato della VM
+	vm.Annotations["externalIP"] = "assigned-external-ip" // Sostituisci con l'IP assegnato
+	vm.Annotations["assignedPort"] = fmt.Sprintf("%d", assignedPort)
+
+	err = r.Update(ctx, vm)
+	if err != nil {
+		log.Error(err, "Errore nell'aggiornamento delle annotazioni della VirtualMachine", "Name", vm.Name, "Namespace", vm.Namespace)
+		return ctrl.Result{}, err
+	}
+	log.Info("Annotazioni della VirtualMachine aggiornate con successo", "Name", vm.Name, "Namespace", vm.Namespace)
 
 	return ctrl.Result{}, nil
 }

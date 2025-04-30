@@ -1,7 +1,7 @@
 apiVersion: networking.example.com/v1alpha1
 kind: ServiceRequest
 metadata:
-  name: myservice-request
+  name: myservice-request1
 spec:
   namespace: ns1
   app: unified
@@ -14,7 +14,7 @@ spec:
 apiVersion: networking.example.com/v1alpha1
 kind: ServiceRequest
 metadata:
-  name: myservice-request-app2
+  name: myservice-request2
 spec:
   namespace: ns1
   app: unified
