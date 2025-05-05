@@ -3,18 +3,18 @@ package controller
 import (
 	"context"
 	"fmt"
-	"math/rand"
-	"time"
-
 	networkingv1alpha1 "github.com/your-repo/service-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	kubevirtv1 "kubevirt.io/api/core/v1"
+	"math/rand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"time"
 )
 
 type ServiceRequestReconciler struct {
@@ -126,6 +126,11 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		Spec: kubevirtv1.VirtualMachineSpec{
 			RunStrategy: &runStrategy, // Modifica qui
 			Template: &kubevirtv1.VirtualMachineInstanceTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"kubevirt.io/domain": serviceRequest.Spec.VMName,
+					},
+				},
 				Spec: kubevirtv1.VirtualMachineInstanceSpec{
 					Domain: kubevirtv1.DomainSpec{
 						Devices: kubevirtv1.Devices{
@@ -184,16 +189,29 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 							VolumeSource: kubevirtv1.VolumeSource{
 								CloudInitNoCloud: &kubevirtv1.CloudInitNoCloudSource{
 									UserData: `#cloud-config
-	password: fedora
-	chpasswd: { expire: False }
-	ssh_pwauth: True
-	packages:
-	  - nginx
-	runcmd:
-	  - echo "Ciao mondo" > /usr/share/nginx/html/index.html
-	  - systemctl enable nginx
-	  - systemctl start nginx
-	`,
+package_update: true
+packages:
+  - nginx
+  - openssh-server
+  - openssh-clients
+ssh_pwauth: true
+disable_root: false
+users:
+  - name: fedora
+    groups: sudo
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    lock_passwd: false
+chpasswd:
+  list: |
+    fedora:fedora
+  expire: False
+runcmd:
+  - echo "Ciao mondo" > /usr/share/nginx/html/index.html
+  - systemctl enable sshd
+  - systemctl start sshd
+  - systemctl enable nginx
+  - systemctl start nginx`,
 								},
 							},
 						},
