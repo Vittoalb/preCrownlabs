@@ -22,6 +22,15 @@ type ServiceRequestReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+var usedPorts = make(map[int]bool) // Mappa per tracciare le porte già utilizzate
+
+/* disapplica tutto
+kubectl delete servicerequest myservice-request-app1 -n default
+kubectl delete servicerequest myservice-request-app2 -n default
+kubectl delete services --all -n ns1
+kubectl delete virtualmachines --all -n ns1
+*/
+
 func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := ctrl.Log.WithName("ServiceRequestController")
 
@@ -37,9 +46,33 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	// Controlla se la VM è già stata creata
+	// Verifica se la VM esiste realmente
+	existingVM := &kubevirtv1.VirtualMachine{}
+	err = r.Get(ctx, client.ObjectKey{Name: serviceRequest.Spec.VMName, Namespace: serviceRequest.Spec.Namespace}, existingVM)
+	vmExists := err == nil
+
+	// Verifica se il Service esiste realmente
+	existingService := &corev1.Service{}
+	err = r.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("service-%s", serviceRequest.Name), Namespace: serviceRequest.Spec.Namespace}, existingService)
+	serviceExists := err == nil
+
+	// Se status è "Created" ma le risorse NON esistono realmente, azzera lo stato
+	if serviceRequest.Status.Status == "Created" && (!vmExists || !serviceExists) {
+		log.Info("VM o Service mancante, reset dello stato per ricreare le risorse", "VM esiste", vmExists, "Service esiste", serviceExists)
+		serviceRequest.Status.Status = ""
+		serviceRequest.Status.AssignedPorts = nil
+		err = r.Status().Update(ctx, serviceRequest)
+		if err != nil {
+			log.Error(err, "Errore nel reset dello stato")
+			return ctrl.Result{}, err
+		}
+		// Requeue per rieseguire il reconcile
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Se tutto esiste e status è "Created", esci
 	if serviceRequest.Status.Status == "Created" {
-		log.Info("La VM è già stata creata", "Name", serviceRequest.Name, "Namespace", serviceRequest.Spec.Namespace)
+		log.Info("La VM e il Service esistono già", "Name", serviceRequest.Name, "Namespace", serviceRequest.Spec.Namespace)
 		return ctrl.Result{}, nil
 	}
 
@@ -48,8 +81,27 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	assignedPorts := []networkingv1alpha1.Service{}
 	basePort := 30000 // Porta iniziale per l'assegnazione dinamica
 
+	// for i, service := range serviceRequest.Spec.Services {
+	// 	assignedPort := basePort + i
+	// 	assignedPorts = append(assignedPorts, networkingv1alpha1.Service{
+	// 		Name:         service.Name,
+	// 		TargetPort:   service.TargetPort,
+	// 		AssignedPort: assignedPort,
+	// 	})
+	// 	log.Info("Porta assegnata", "Service", service.Name, "AssignedPort", assignedPort)
+	// }
+
 	for i, service := range serviceRequest.Spec.Services {
 		assignedPort := basePort + i
+
+		// Trova una porta libera
+		for usedPorts[assignedPort] {
+			assignedPort++
+		}
+
+		// Segna la porta come utilizzata
+		usedPorts[assignedPort] = true
+
 		assignedPorts = append(assignedPorts, networkingv1alpha1.Service{
 			Name:         service.Name,
 			TargetPort:   service.TargetPort,
@@ -153,11 +205,7 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	log.Info("Creazione della VM", "Name", vm.ObjectMeta.Name, "Namespace", vm.ObjectMeta.Namespace)
 
-	existingVM := &kubevirtv1.VirtualMachine{}
-	err = r.Get(ctx, client.ObjectKey{Name: vm.Name, Namespace: vm.Namespace}, existingVM)
-	if err == nil {
-		log.Info("La VM esiste già, salto la creazione", "VMName", vm.Name, "Namespace", vm.Namespace)
-	} else if errors.IsNotFound(err) {
+	if !vmExists {
 		err = r.Create(ctx, vm)
 		if err != nil {
 			log.Error(err, "Errore nella creazione della VM", "VMName", vm.Name, "Namespace", vm.Namespace)
@@ -165,8 +213,7 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		log.Info("VM creata con successo", "VMName", vm.Name, "Namespace", vm.Namespace)
 	} else {
-		log.Error(err, "Errore nel recuperare la VM esistente")
-		return ctrl.Result{}, err
+		log.Info("La VM esiste già, salto la creazione", "VMName", vm.Name, "Namespace", vm.Namespace)
 	}
 
 	// Crea il servizio Kubernetes con MetalLB

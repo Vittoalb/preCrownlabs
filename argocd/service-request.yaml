@@ -11,3 +11,4 @@ spec:
       targetPort: 8080
     - name: ssh
       targetPort: 22
+
