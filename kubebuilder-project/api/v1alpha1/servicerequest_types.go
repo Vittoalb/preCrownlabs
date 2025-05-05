@@ -4,19 +4,25 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// Service rappresenta un servizio con una porta assegnata
+type Service struct {
+	Name         string `json:"name"`
+	TargetPort   int    `json:"targetPort"`
+	AssignedPort int    `json:"assignedPort,omitempty"`
+}
+
 // ServiceRequestSpec definisce i campi di input per la richiesta
 type ServiceRequestSpec struct {
-	Namespace     string `json:"namespace"`               // Namespace in cui creare il servizio
-	App           string `json:"app"`                     // Nome dell'applicazione
-	Component     string `json:"component"`               // Componente dell'applicazione
-	TargetPort    int    `json:"targetPort"`              // Porta target specificata dall'utente
-	AllowSharedIP bool   `json:"allowSharedIP,omitempty"` // Nuovo campo per abilitare l'IP sharing
+	Namespace string    `json:"namespace"`
+	VMName    string    `json:"vmName"`
+	Services  []Service `json:"services"`
 }
 
 // ServiceRequestStatus tiene traccia dello stato della richiesta
 type ServiceRequestStatus struct {
-	AssignedPort int    `json:"assignedPort,omitempty"` // Porta assegnata dinamicamente
-	Status       string `json:"status,omitempty"`       // Stato della richiesta (es. "Created")
+	Status        string    `json:"status,omitempty"`
+	AssignedIP    string    `json:"assignedIP,omitempty"`
+	AssignedPorts []Service `json:"assignedPorts,omitempty"`
 }
 
 //+kubebuilder:object:root=true

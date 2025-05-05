@@ -39,27 +39,50 @@ spec:
           spec:
             description: ServiceRequestSpec definisce i campi di input per la richiesta
             properties:
-              allowSharedIP:
-                type: boolean
-              app:
-                type: string
-              component:
-                type: string
               namespace:
                 type: string
-              targetPort:
-                type: integer
+              services:
+                items:
+                  description: Service rappresenta un servizio con una porta assegnata
+                  properties:
+                    assignedPort:
+                      type: integer
+                    name:
+                      type: string
+                    targetPort:
+                      type: integer
+                  required:
+                  - name
+                  - targetPort
+                  type: object
+                type: array
+              vmName:
+                type: string
             required:
-            - app
-            - component
             - namespace
-            - targetPort
+            - services
+            - vmName
             type: object
           status:
             description: ServiceRequestStatus tiene traccia dello stato della richiesta
             properties:
-              assignedPort:
-                type: integer
+              assignedIP:
+                type: string
+              assignedPorts:
+                items:
+                  description: Service rappresenta un servizio con una porta assegnata
+                  properties:
+                    assignedPort:
+                      type: integer
+                    name:
+                      type: string
+                    targetPort:
+                      type: integer
+                  required:
+                  - name
+                  - targetPort
+                  type: object
+                type: array
               status:
                 type: string
             type: object

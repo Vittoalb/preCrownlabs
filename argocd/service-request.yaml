@@ -1,23 +1,13 @@
 apiVersion: networking.example.com/v1alpha1
 kind: ServiceRequest
 metadata:
-  name: myservice-request1
+  name: myservice-request-app2
+  namespace: default
 spec:
   namespace: ns1
-  app: unified
-  component: app1
-  targetPort: 8080
-  allowSharedIP: true
-
----
-
-apiVersion: networking.example.com/v1alpha1
-kind: ServiceRequest
-metadata:
-  name: myservice-request2
-spec:
-  namespace: ns1
-  app: unified
-  component: app2
-  targetPort: 8081
-  allowSharedIP: true
+  vmName: testvm-app2
+  services:
+    - name: http
+      targetPort: 8080
+    - name: ssh
+      targetPort: 22
