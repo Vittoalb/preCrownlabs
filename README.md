@@ -45,27 +45,27 @@ kind version
 kubectl version --client
 docker --version
 ```
-## **2. Setup basic Cluster**
+### **2. Setup basic Cluster**
 
-### Run Kind Cluster
+#### Run Kind Cluster
 
    ```bash
    kind create cluster --name argocddemo --config kind-config.yml
    ```
 
-### Install a CNI
+#### Install a CNI
 
    ```bash
    cilium install --wait
    ```
 
-## **3. Add LoadBalancer for IP Configuration
+### **3. Add LoadBalancer for IP Configuration**
    ```bash
       kubectl create namespace metallb-system
       helm install metallb metallb/metallb -n metallb-system -f metallb-config.yaml
    ```
 
-## **4. Deploy Kubevirt for VM operations
+### **4. Deploy Kubevirt for VM operations**
 Segui in ordine questa serie di comandi.
 Verifica di avere "curl" installato prima di procedere.
 ```bash
@@ -77,6 +77,7 @@ Fai un check che tutto sia ok attraverso
 echo $RELEASE
 ### response ex. v0.19.0
 ```
+Dopodichè procediamo con l'installazione degli operatore e della CR che farà da trigger per l'operator.
 ```bash
 ### Deploy the KubeVirt operator
 kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${RELEASE}/kubevirt-operator.yaml
@@ -90,7 +91,7 @@ kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${RELEAS
 kubectl -n kubevirt wait kv kubevirt --for condition=Available
 ```
 
-## **4. Deploy Operators
+### **5. Deploy Operators**
 Vai nella cartella argocd, dopodichè esegui:
 ``` bash
 kubectl apply -f servicerequest-crd.yaml
@@ -101,7 +102,7 @@ make build
 make run
 ```
 
-## **5. Start using VMs with public IPs
+### **6. Start using VMs with public IPs**
 Per utilizzare il progetto, puoi creare una VM con IP pubblico. Puoi farlo attraverso il file "service-request.yaml" presente nella cartella argocd, oppure attraverso il controller creato con kubebuilder.
 Il file service-request.yaml è un esempio di richiesta di creazione di una VM con un indirizzo IP pubblico associato. Puoi modificarlo secondo le tue esigenze.
 In particolare il file è ideato per:
@@ -109,12 +110,12 @@ In particolare il file è ideato per:
 - esporre 2 servizi e quindi verificare che ciò sia possibile anche per metallb
 - essere riapplicato più volte e verificare che non ci siano problemi di condivisione dell'IP per utilizzo dello stesso servizio
 
-### Esempio di utilizzo del file service-request.yaml:
+#### Esempio di utilizzo del file service-request.yaml:
 ``` bash
 kubectl apply -f service-request.yaml
 ```
 
-## **6. Verifica delle risorse create
+### **7. Verifica delle risorse create**
 Puoi verificare le risorse create utilizzando i seguenti comandi:
 ``` bash
 kubectl get vm --all-namespaces
