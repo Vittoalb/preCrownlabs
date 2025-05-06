@@ -11,10 +11,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	kubevirtv1 "kubevirt.io/api/core/v1"
-	"math/rand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"time"
+	
 )
 
 type ServiceRequestReconciler struct {
@@ -29,6 +28,8 @@ kubectl delete servicerequest myservice-request-app1 -n default
 kubectl delete servicerequest myservice-request-app2 -n default
 kubectl delete services --all -n ns1
 kubectl delete virtualmachines --all -n ns1
+kubectl delete services --all -n ns2
+kubectl delete virtualmachines --all -n ns2
 */
 
 func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -77,19 +78,11 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	// Assegna porte dinamiche per i servizi
-	rand.Seed(time.Now().UnixNano())
+	
 	assignedPorts := []networkingv1alpha1.Service{}
 	basePort := 30000 // Porta iniziale per l'assegnazione dinamica
 
-	// for i, service := range serviceRequest.Spec.Services {
-	// 	assignedPort := basePort + i
-	// 	assignedPorts = append(assignedPorts, networkingv1alpha1.Service{
-	// 		Name:         service.Name,
-	// 		TargetPort:   service.TargetPort,
-	// 		AssignedPort: assignedPort,
-	// 	})
-	// 	log.Info("Porta assegnata", "Service", service.Name, "AssignedPort", assignedPort)
-	// }
+	// Verifica se ci sono porte già utilizzate
 
 	for i, service := range serviceRequest.Spec.Services {
 		assignedPort := basePort + i
