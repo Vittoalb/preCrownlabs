@@ -1,15 +1,15 @@
 apiVersion: networking.example.com/v1alpha1
 kind: ServiceRequest
 metadata:
-  name: myservice-request-app2
-  namespace: default
+  name: myservice-request-app6
+  namespace: ns1
 spec:
   namespace: ns1
-  vmName: testvm-app2
+  vmName: testvm-app6
   services:
     - name: http
       targetPort: 8080
-      port: 0
+      port: 30007
     - name: ssh
       targetPort: 22
-      port: 0
+      port: 30004
