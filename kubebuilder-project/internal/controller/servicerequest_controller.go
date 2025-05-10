@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+
 	networkingv1alpha1 "github.com/your-repo/service-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -11,9 +12,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	kubevirtv1 "kubevirt.io/api/core/v1"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 type ServiceRequestReconciler struct {
@@ -22,15 +24,7 @@ type ServiceRequestReconciler struct {
 }
 
 var usedPorts = make(map[int]bool) // Mappa per tracciare le porte già utilizzate
-
-/* disapplica tutto
-kubectl delete servicerequest myservice-request-app1 -n default
-kubectl delete servicerequest myservice-request-app2 -n default
-kubectl delete services --all -n ns1
-kubectl delete virtualmachines --all -n ns1
-kubectl delete services --all -n ns2
-kubectl delete virtualmachines --all -n ns2
-*/
+const finalizerName = "servicerequest.networking.example.com/finalizer"
 
 func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := ctrl.Log.WithName("ServiceRequestController")
@@ -47,10 +41,49 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	// Verifica se la VM esiste realmente
+	// FINALIZER: Cleanup prima della cancellazione
+	if serviceRequest.ObjectMeta.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(serviceRequest, finalizerName) {
+			controllerutil.AddFinalizer(serviceRequest, finalizerName)
+			if err := r.Update(ctx, serviceRequest); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		if controllerutil.ContainsFinalizer(serviceRequest, finalizerName) {
+			log.Info("Pulizia risorse prima della rimozione", "Name", serviceRequest.Name)
+
+			// Cancella il servizio Kubernetes associato
+			service := &corev1.Service{}
+			svcErr := r.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("service-%s", serviceRequest.Name), Namespace: serviceRequest.Spec.Namespace}, service)
+			if svcErr == nil {
+				_ = r.Delete(ctx, service)
+			}
+
+			// Libera le porte
+			for _, svc := range serviceRequest.Status.AssignedPorts {
+				log.Info("Rilascio porta", "Port", svc.AssignedPort)
+				delete(usedPorts, svc.AssignedPort)
+			}
+
+			// Rimuove il finalizer
+			controllerutil.RemoveFinalizer(serviceRequest, finalizerName)
+			if err := r.Update(ctx, serviceRequest); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Verifica esistenza risorse
 	existingVM := &kubevirtv1.VirtualMachine{}
 	err = r.Get(ctx, client.ObjectKey{Name: serviceRequest.Spec.VMName, Namespace: serviceRequest.Spec.Namespace}, existingVM)
 	vmExists := err == nil
+
+	// Aggiungi OwnerReference al tuo ServiceRequest (fa sì che la VM possieda la ServiceRequest)
+	if vmExists {
+		controllerutil.SetControllerReference(existingVM, serviceRequest, r.Scheme)
+	}
 
 	// Verifica se il Service esiste realmente
 	existingService := &corev1.Service{}
@@ -77,111 +110,76 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	// Assegna porte dinamiche per i servizi
-	
+	// Assegna porte
 	assignedPorts := []networkingv1alpha1.Service{}
 	basePort := 30000 // Porta iniziale per l'assegnazione dinamica
 
 	// Verifica se ci sono porte già utilizzate
+	for _, svc := range serviceRequest.Spec.Services {
+		var assignedPort int
 
-	for i, service := range serviceRequest.Spec.Services {
-		assignedPort := basePort + i
-
-		// Trova una porta libera
-		for usedPorts[assignedPort] {
-			assignedPort++
+		if svc.Port == 0 {
+			assignedPort = basePort
+			for usedPorts[assignedPort] {
+				assignedPort++
+			}
+		} else {
+			assignedPort = svc.Port
 		}
 
-		// Segna la porta come utilizzata
 		usedPorts[assignedPort] = true
-
 		assignedPorts = append(assignedPorts, networkingv1alpha1.Service{
-			Name:         service.Name,
-			TargetPort:   service.TargetPort,
+			Name:         svc.Name,
+			TargetPort:   svc.TargetPort,
 			AssignedPort: assignedPort,
 		})
-		log.Info("Porta assegnata", "Service", service.Name, "AssignedPort", assignedPort)
+		log.Info("Porta assegnata", "Service", svc.Name, "AssignedPort", assignedPort)
 	}
 
-	// Crea la VM
+	// Crea VM
 	runStrategy := kubevirtv1.RunStrategyAlways
 	if serviceRequest.Spec.VMName == "" {
-		log.Error(nil, "Spec.VMName è vuoto. Impossibile creare la VM.")
 		return ctrl.Result{}, fmt.Errorf("spec.vmName è richiesto ma è vuoto")
 	}
 
 	vm := &kubevirtv1.VirtualMachine{
 		ObjectMeta: ctrl.ObjectMeta{
-			//GenerateName: fmt.Sprintf("vm-%s-", serviceRequest.Name), // Usa generateName per creare un nome univoco
 			Name:      serviceRequest.Spec.VMName,
 			Namespace: serviceRequest.Spec.Namespace,
 		},
 		Spec: kubevirtv1.VirtualMachineSpec{
-			RunStrategy: &runStrategy, // Modifica qui
+			RunStrategy: &runStrategy,
 			Template: &kubevirtv1.VirtualMachineInstanceTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"kubevirt.io/domain": serviceRequest.Spec.VMName,
-					},
+					Labels: map[string]string{"kubevirt.io/domain": serviceRequest.Spec.VMName},
 				},
 				Spec: kubevirtv1.VirtualMachineInstanceSpec{
 					Domain: kubevirtv1.DomainSpec{
 						Devices: kubevirtv1.Devices{
 							Disks: []kubevirtv1.Disk{
-								{
-									Name: "containerdisk",
-									DiskDevice: kubevirtv1.DiskDevice{
-										Disk: &kubevirtv1.DiskTarget{
-											Bus: "virtio",
-										},
-									},
-								},
-								{
-									Name: "cloudinitdisk",
-									DiskDevice: kubevirtv1.DiskDevice{
-										Disk: &kubevirtv1.DiskTarget{
-											Bus: "virtio",
-										},
-									},
-								},
+								{Name: "containerdisk", DiskDevice: kubevirtv1.DiskDevice{Disk: &kubevirtv1.DiskTarget{Bus: "virtio"}}},
+								{Name: "cloudinitdisk", DiskDevice: kubevirtv1.DiskDevice{Disk: &kubevirtv1.DiskTarget{Bus: "virtio"}}},
 							},
 							Interfaces: []kubevirtv1.Interface{
-								{
-									Name: "default",
-									InterfaceBindingMethod: kubevirtv1.InterfaceBindingMethod{
-										Masquerade: &kubevirtv1.InterfaceMasquerade{},
-									},
-								},
+								{Name: "default", InterfaceBindingMethod: kubevirtv1.InterfaceBindingMethod{Masquerade: &kubevirtv1.InterfaceMasquerade{}}},
 							},
 						},
 						Resources: kubevirtv1.ResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceMemory: resource.MustParse("1024Mi"), // Modifica qui
+								corev1.ResourceMemory: resource.MustParse("1024Mi"),
 							},
 						},
 					},
 					Networks: []kubevirtv1.Network{
-						{
-							Name: "default",
-							NetworkSource: kubevirtv1.NetworkSource{
-								Pod: &kubevirtv1.PodNetwork{},
-							},
-						},
+						{Name: "default", NetworkSource: kubevirtv1.NetworkSource{Pod: &kubevirtv1.PodNetwork{}}},
 					},
 					Volumes: []kubevirtv1.Volume{
-						{
-							Name: "containerdisk",
-							VolumeSource: kubevirtv1.VolumeSource{
-								ContainerDisk: &kubevirtv1.ContainerDiskSource{
-									Image: "kubevirt/fedora-cloud-container-disk-demo",
-								},
-							},
-						},
-						{
-							Name: "cloudinitdisk",
-							VolumeSource: kubevirtv1.VolumeSource{
-								CloudInitNoCloud: &kubevirtv1.CloudInitNoCloudSource{
-									UserData: `#cloud-config
+						{Name: "containerdisk", VolumeSource: kubevirtv1.VolumeSource{
+							ContainerDisk: &kubevirtv1.ContainerDiskSource{Image: "kubevirt/fedora-cloud-container-disk-demo"},
+						}},
+						{Name: "cloudinitdisk", VolumeSource: kubevirtv1.VolumeSource{
+							CloudInitNoCloud: &kubevirtv1.CloudInitNoCloudSource{
+								UserData: `#cloud-config
 package_update: true
 packages:
   - nginx
@@ -205,29 +203,21 @@ runcmd:
   - systemctl start sshd
   - systemctl enable nginx
   - systemctl start nginx`,
-								},
 							},
-						},
+						}},
 					},
 				},
 			},
 		},
 	}
 
-	log.Info("Creazione della VM", "Name", vm.ObjectMeta.Name, "Namespace", vm.ObjectMeta.Namespace)
-
 	if !vmExists {
-		err = r.Create(ctx, vm)
-		if err != nil {
-			log.Error(err, "Errore nella creazione della VM", "VMName", vm.Name, "Namespace", vm.Namespace)
+		if err = r.Create(ctx, vm); err != nil {
 			return ctrl.Result{}, err
 		}
-		log.Info("VM creata con successo", "VMName", vm.Name, "Namespace", vm.Namespace)
-	} else {
-		log.Info("La VM esiste già, salto la creazione", "VMName", vm.Name, "Namespace", vm.Namespace)
 	}
 
-	// Crea il servizio Kubernetes con MetalLB
+	// Crea Service
 	service := &corev1.Service{
 		ObjectMeta: ctrl.ObjectMeta{
 			Name:      fmt.Sprintf("service-%s", serviceRequest.Name),
@@ -238,46 +228,46 @@ runcmd:
 			},
 		},
 		Spec: corev1.ServiceSpec{
-			Type: corev1.ServiceTypeLoadBalancer,
-			Selector: map[string]string{
-				"kubevirt.io/domain": serviceRequest.Spec.VMName,
-			},
-			Ports: []corev1.ServicePort{},
+			Type:     corev1.ServiceTypeLoadBalancer,
+			Selector: map[string]string{"kubevirt.io/domain": serviceRequest.Spec.VMName},
+			Ports:    []corev1.ServicePort{},
 		},
 	}
 
-	for _, assignedPort := range assignedPorts {
+	for _, svc := range assignedPorts {
 		service.Spec.Ports = append(service.Spec.Ports, corev1.ServicePort{
-			Name:       assignedPort.Name,
+			Name:       svc.Name,
 			Protocol:   corev1.ProtocolTCP,
-			Port:       int32(assignedPort.AssignedPort),
-			TargetPort: intstr.FromInt(assignedPort.TargetPort),
+			Port:       int32(svc.AssignedPort),
+			TargetPort: intstr.FromInt(svc.TargetPort),
 		})
 	}
 
-	err = r.Create(ctx, service)
-	if err != nil {
-		log.Error(err, "Errore nella creazione del servizio Kubernetes", "ServiceName", service.Name, "Namespace", service.Namespace)
+	// Aggiungi OwnerReference al Service (ServiceRequest è il padre)
+	controllerutil.SetControllerReference(serviceRequest, service, r.Scheme)
+
+	if err = r.Create(ctx, service); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("Servizio Kubernetes creato con successo", "ServiceName", service.Name, "Namespace", service.Namespace)
 
-	// Aggiorna lo stato della ServiceRequest
+	// Aggiorna stato
 	serviceRequest.Status.Status = "Created"
 	serviceRequest.Status.AssignedPorts = assignedPorts
-	err = r.Status().Update(ctx, serviceRequest)
-	if err != nil {
-		log.Error(err, "Errore nell'aggiornamento dello stato della ServiceRequest", "Name", serviceRequest.Name, "Namespace", serviceRequest.Spec.Namespace)
+	if err = r.Status().Update(ctx, serviceRequest); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("Stato della ServiceRequest aggiornato con successo", "Name", serviceRequest.Name, "Namespace", serviceRequest.Spec.Namespace)
 
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager configura il controller
 func (r *ServiceRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1alpha1.ServiceRequest{}).
 		Complete(r)
 }
+
+/* disapplica tutto
+kubectl delete servicerequest --all -n default
+kubectl delete services --all -n ns1
+kubectl delete virtualmachines --all -n ns1
+*/

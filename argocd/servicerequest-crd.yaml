@@ -46,6 +46,11 @@ spec:
                       type: integer
                       description: "La porta di destinazione del servizio."
                       minimum: 1
+                    port:
+                      type: integer
+                      description: "La porta del servizio. Se non specificata, verrà generata automaticamente."
+                      minimum: 0
+                      maximum: 65535  
             required:
             - vmName 
             - namespace

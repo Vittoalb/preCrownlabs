@@ -8,7 +8,8 @@ import (
 type Service struct {
 	Name         string `json:"name"`
 	TargetPort   int    `json:"targetPort"`
-	AssignedPort int    `json:"assignedPort,omitempty"`
+	Port         int    `json:"port,omitempty"`         // <--- aggiunto: richiesta utente
+	AssignedPort int    `json:"assignedPort,omitempty"` // <--- assegnata dal controller
 }
 
 // ServiceRequestSpec definisce i campi di input per la richiesta
