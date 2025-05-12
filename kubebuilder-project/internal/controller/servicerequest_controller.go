@@ -18,9 +18,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// ServiceRequestReconciler reconciles ServiceRequest resources
-// -----------------------------------------------------------------------------
-
 type ServiceRequestReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
