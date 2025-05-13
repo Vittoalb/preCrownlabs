@@ -4,18 +4,27 @@ import (
 	"context"
 	"fmt"
 
-	networkingv1alpha1 "github.com/your-repo/service-operator/api/v1alpha1"
+	networkingv1alpha1 "github.com/your-repo/service-operator/api/v1alpha1" // Modifica questo con il tuo modulo effettivo
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+const (
+	finalizerName   = "servicerequest.networking.example.com/finalizer"
+	metallbPoolName = "my-ip-pool"
+	sharedIPValue   = "true" // valore per l'annotazione allow-shared-ip
+	basePort        = 30000  // porta iniziale per l'assegnazione automatica
 )
 
 type ServiceRequestReconciler struct {
@@ -23,23 +32,176 @@ type ServiceRequestReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-var (
-	usedPorts     = make(map[int]bool)                                // porte in uso
-	finalizerName = "servicerequest.networking.example.com/finalizer" // finalizer costante
-)
+// updateUsedPortsByIP aggiorna la mappa dei port in uso per ciascun IP
+func (r *ServiceRequestReconciler) updateUsedPortsByIP(ctx context.Context, namespace string) (map[string]map[int]bool, error) {
+	usedPortsByIP := make(map[string]map[int]bool)
+	logger := log.FromContext(ctx)
 
-// ----------------------------------------------------------------------------
-// Reconcile
-// ----------------------------------------------------------------------------
+	// Ottieni tutti i servizi LoadBalancer
+	svcList := &corev1.ServiceList{}
+	if err := r.List(ctx, svcList, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
 
+	for _, svc := range svcList.Items {
+		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+			continue
+		}
+
+		// Ottieni l'IP esterno assegnato
+		var externalIP string
+		if len(svc.Status.LoadBalancer.Ingress) > 0 {
+			externalIP = svc.Status.LoadBalancer.Ingress[0].IP
+		} else {
+			// Se il servizio non ha ancora un IP assegnato, prova a trovarlo nelle annotazioni
+			if specIP, ok := svc.Annotations["metallb.universe.tf/loadBalancerIPs"]; ok {
+				externalIP = specIP
+			} else {
+				continue // Non possiamo determinare l'IP
+			}
+		}
+
+		// Inizializza la mappa per questo IP se non esiste
+		if _, exists := usedPortsByIP[externalIP]; !exists {
+			usedPortsByIP[externalIP] = make(map[int]bool)
+		}
+
+		// Registra le porte utilizzate
+		for _, port := range svc.Spec.Ports {
+			usedPortsByIP[externalIP][int(port.Port)] = true
+			logger.Info("Porta registrata come in uso", "ip", externalIP, "porta", port.Port)
+		}
+	}
+
+	return usedPortsByIP, nil
+}
+
+// getMetalLBIPPool ottiene il pool di IP configurato in MetalLB
+func (r *ServiceRequestReconciler) getMetalLBIPPool(ctx context.Context) ([]string, error) {
+	// In un'implementazione reale, dovresti interrogare il ConfigMap di MetalLB
+	// Per ora, restituiamo un pool di IP fisso per semplicità
+	return []string{
+		"172.18.0.240", "172.18.0.241", "172.18.0.242", "172.18.0.243",
+		"172.18.0.244", "172.18.0.245", "172.18.0.246", "172.18.0.247",
+		"172.18.0.248", "172.18.0.249", "172.18.0.250",
+	}, nil
+}
+
+// findBestIP trova l'IP migliore per le porte richieste
+func (r *ServiceRequestReconciler) findBestIP(ctx context.Context, sr *networkingv1alpha1.ServiceRequest,
+	usedPortsByIP map[string]map[int]bool) (string, []networkingv1alpha1.Service, error) {
+
+	logger := log.FromContext(ctx)
+
+	// 1. Prima controlla se esiste un IP esistente in grado di ospitare tutte le porte richieste
+	for ip, usedPorts := range usedPortsByIP {
+		// Verifica compatibilità
+		compatible := true
+		for _, s := range sr.Spec.Services {
+			if s.Port > 0 && usedPorts[s.Port] {
+				compatible = false
+				logger.Info("IP non compatibile - porta specifica già in uso", "ip", ip, "porta", s.Port)
+				break
+			}
+		}
+
+		if !compatible {
+			continue
+		}
+
+		// Questo IP è compatibile, assegna le porte
+		logger.Info("Trovato IP esistente compatibile", "ip", ip)
+		assigned := []networkingv1alpha1.Service{}
+		nextPort := basePort
+
+		for _, s := range sr.Spec.Services {
+			port := s.Port
+			if port == 0 {
+				// Trova la prossima porta disponibile
+				for usedPorts[nextPort] {
+					nextPort++
+				}
+				port = nextPort
+				nextPort++
+			}
+
+			assigned = append(assigned, networkingv1alpha1.Service{
+				Name:         s.Name,
+				TargetPort:   s.TargetPort,
+				AssignedPort: port,
+			})
+
+			// Registra questa porta come usata
+			usedPorts[port] = true
+		}
+
+		return ip, assigned, nil
+	}
+
+	// 2. Nessun IP esistente è compatibile, cerca un nuovo IP dal pool
+	ipPool, err := r.getMetalLBIPPool(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Trova il primo IP nel pool che non è già in uso
+	for _, ip := range ipPool {
+		if _, isUsed := usedPortsByIP[ip]; !isUsed {
+			logger.Info("Assegnazione nuovo IP dal pool", "ip", ip)
+
+			assigned := []networkingv1alpha1.Service{}
+			nextPort := basePort
+
+			for _, s := range sr.Spec.Services {
+				port := s.Port
+				if port == 0 {
+					port = nextPort
+					nextPort++
+				}
+
+				assigned = append(assigned, networkingv1alpha1.Service{
+					Name:         s.Name,
+					TargetPort:   s.TargetPort,
+					AssignedPort: port,
+				})
+			}
+
+			return ip, assigned, nil
+		}
+	}
+
+	// 3. Se tutti gli IP del pool sono già in uso, lasciamo che MetalLB ne scelga uno automaticamente
+	logger.Info("IP pool esaurito, lasciando che MetalLB scelga automaticamente")
+
+	assigned := []networkingv1alpha1.Service{}
+	nextPort := basePort
+
+	for _, s := range sr.Spec.Services {
+		port := s.Port
+		if port == 0 {
+			port = nextPort
+			nextPort++
+		}
+
+		assigned = append(assigned, networkingv1alpha1.Service{
+			Name:         s.Name,
+			TargetPort:   s.TargetPort,
+			AssignedPort: port,
+		})
+	}
+
+	return "", assigned, nil
+}
+
+// Reconcile gestisce la riconciliazione degli oggetti ServiceRequest
 func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := ctrl.Log.WithName("ServiceRequestController")
+	logger := log.FromContext(ctx)
 
 	// 1. Carica la risorsa -----------------------------------------------------------------
 	sr := &networkingv1alpha1.ServiceRequest{}
 	if err := r.Get(ctx, req.NamespacedName, sr); err != nil {
 		if errors.IsNotFound(err) {
-			log.Info("ServiceRequest non esiste più", "name", req.Name)
+			logger.Info("ServiceRequest non esiste più", "name", req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -57,17 +219,14 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	} else {
 		// in cancellazione → cleanup
 		if controllerutil.ContainsFinalizer(sr, finalizerName) {
-			log.Info("Cleanup risorse associate prima della rimozione", "name", sr.Name)
+			logger.Info("Cleanup risorse associate prima della rimozione", "name", sr.Name)
 
 			// Elimina Service LB
 			svc := &corev1.Service{}
-			if err := r.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("service-%s", sr.Name), Namespace: sr.Spec.Namespace}, svc); err == nil {
-				_ = r.Delete(ctx, svc)
-			}
-
-			// Libera porte
-			for _, p := range sr.Status.AssignedPorts {
-				delete(usedPorts, p.AssignedPort)
+			if err := r.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("service-%s", sr.Name), Namespace: sr.Spec.Namespace}, svc); err == nil {
+				if err := r.Delete(ctx, svc); err != nil && !errors.IsNotFound(err) {
+					return ctrl.Result{}, err
+				}
 			}
 
 			// Rimuovi finalizer
@@ -81,26 +240,27 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// 3. Controllo esistenza risorse --------------------------------------------------------
 	vm := &kubevirtv1.VirtualMachine{}
-	vmKey := client.ObjectKey{Name: sr.Spec.VMName, Namespace: sr.Spec.Namespace}
+	vmKey := types.NamespacedName{Name: sr.Spec.VMName, Namespace: sr.Spec.Namespace}
 	vmExists := r.Get(ctx, vmKey, vm) == nil
 
 	svc := &corev1.Service{}
-	svcKey := client.ObjectKey{Name: fmt.Sprintf("service-%s", sr.Name), Namespace: sr.Spec.Namespace}
+	svcKey := types.NamespacedName{Name: fmt.Sprintf("service-%s", sr.Name), Namespace: sr.Spec.Namespace}
 	svcExists := r.Get(ctx, svcKey, svc) == nil
 
-	// 3.a: se VM NON esiste ma Service sì  → cleanup & requeue
+	// 3.a: se VM NON esiste ma Service sì → cleanup & requeue
 	if !vmExists && svcExists {
-		log.Info("VM rimossa manualmente: elimino Service e rilascio porte", "service", svc.Name)
+		logger.Info("VM rimossa manualmente: elimino Service", "service", svc.Name)
 		if err := r.Delete(ctx, svc); err != nil && !errors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
-		for _, p := range sr.Status.AssignedPorts {
-			delete(usedPorts, p.AssignedPort)
-		}
+
 		// reset stato e riesegui reconcile
 		sr.Status.Status = ""
 		sr.Status.AssignedPorts = nil
-		_ = r.Status().Update(ctx, sr)
+		if err := r.Status().Update(ctx, sr); err != nil {
+			return ctrl.Result{}, err
+		}
+
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -109,26 +269,21 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	// 4. Assegna porte ---------------------------------------------------------------------
-	assigned := []networkingv1alpha1.Service{}
-	base := 30000
-	for _, s := range sr.Spec.Services {
-		port := s.Port
-		if port == 0 {
-			port = base
-			for usedPorts[port] {
-				port++
-			}
-		}
-		usedPorts[port] = true
-		assigned = append(assigned, networkingv1alpha1.Service{
-			Name:         s.Name,
-			TargetPort:   s.TargetPort,
-			AssignedPort: port,
-		})
+	// 4. Aggiorna la mappa dei porti usati -------------------------------------------------
+	usedPortsByIP, err := r.updateUsedPortsByIP(ctx, sr.Spec.Namespace)
+	if err != nil {
+		logger.Error(err, "Errore nell'aggiornare la mappa delle porte usate")
+		return ctrl.Result{}, err
 	}
 
-	// 5. Crea VM se manca ------------------------------------------------------------------
+	// 5. Trova il miglior IP e assegna le porte --------------------------------------------
+	targetIP, assigned, err := r.findBestIP(ctx, sr, usedPortsByIP)
+	if err != nil {
+		logger.Error(err, "Errore nel trovare un IP adatto")
+		return ctrl.Result{}, err
+	}
+
+	// 6. Crea VM se manca ------------------------------------------------------------------
 	runStrategy := kubevirtv1.RunStrategyAlways
 	if !vmExists {
 		vm = &kubevirtv1.VirtualMachine{
@@ -147,13 +302,24 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 						Domain: kubevirtv1.DomainSpec{
 							Devices: kubevirtv1.Devices{
 								Interfaces: []kubevirtv1.Interface{{
-									Name: "default", InterfaceBindingMethod: kubevirtv1.InterfaceBindingMethod{Masquerade: &kubevirtv1.InterfaceMasquerade{}}}},
+									Name: "default",
+									InterfaceBindingMethod: kubevirtv1.InterfaceBindingMethod{
+										Masquerade: &kubevirtv1.InterfaceMasquerade{},
+									},
+								}},
 							},
 							Resources: kubevirtv1.ResourceRequirements{
-								Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1024Mi")},
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("1024Mi"),
+								},
 							},
 						},
-						Networks: []kubevirtv1.Network{{Name: "default", NetworkSource: kubevirtv1.NetworkSource{Pod: &kubevirtv1.PodNetwork{}}}},
+						Networks: []kubevirtv1.Network{{
+							Name: "default",
+							NetworkSource: kubevirtv1.NetworkSource{
+								Pod: &kubevirtv1.PodNetwork{},
+							},
+						}},
 					},
 				},
 			},
@@ -161,32 +327,51 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if err := r.Create(ctx, vm); err != nil {
 			return ctrl.Result{}, err
 		}
+
+		// Ricarica la VM
+		if err := r.Get(ctx, vmKey, vm); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
-	// 5.a: ServiceRequest diventa FIGLIA della VM per GC automatico -------------------------
+	// 7. ServiceRequest diventa FIGLIA della VM per GC automatico -------------------------
 	if err := controllerutil.SetControllerReference(vm, sr, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.Update(ctx, sr); err != nil {
+		if errors.IsConflict(err) {
+			// Se c'è un conflitto, riprova
+			return ctrl.Result{Requeue: true}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
-	// 6. Crea/aggiorna Service --------------------------------------------------------------
+	// 8. Crea/aggiorna Service --------------------------------------------------------------
 	if !svcExists {
+		annotations := map[string]string{
+			"metallb.universe.tf/address-pool":    metallbPoolName,
+			"metallb.universe.tf/allow-shared-ip": sharedIPValue, // Sempre presente
+		}
+
+		// Se abbiamo un IP specifico, aggiungilo come annotazione
+		if targetIP != "" {
+			annotations["metallb.universe.tf/loadBalancerIPs"] = targetIP
+			logger.Info("Richiesto IP specifico", "ip", targetIP)
+		}
+
 		svc = &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("service-%s", sr.Name),
-				Namespace: sr.Spec.Namespace,
-				Annotations: map[string]string{
-					"metallb.universe.tf/address-pool":    "my-ip-pool",
-					"metallb.universe.tf/allow-shared-ip": "true",
-				},
+				Name:        fmt.Sprintf("service-%s", sr.Name),
+				Namespace:   sr.Spec.Namespace,
+				Annotations: annotations,
 			},
 			Spec: corev1.ServiceSpec{
-				Type:     corev1.ServiceTypeLoadBalancer,
-				Selector: map[string]string{"kubevirt.io/domain": sr.Spec.VMName},
+				Type:                  corev1.ServiceTypeLoadBalancer,
+				Selector:              map[string]string{"kubevirt.io/domain": sr.Spec.VMName},
+				ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeCluster,
 			},
 		}
+
 		for _, p := range assigned {
 			svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{
 				Name:       p.Name,
@@ -195,32 +380,41 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				TargetPort: intstr.FromInt(p.TargetPort),
 			})
 		}
-		// SR è la owner del Service per cleanup via finalizer
+
+		// SR è la owner del Service
 		if err := controllerutil.SetControllerReference(sr, svc, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
+
 		if err := r.Create(ctx, svc); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
-	// 7. Aggiorna Status --------------------------------------------------------------------
+	// 9. Aggiorna Status --------------------------------------------------------------------
 	sr.Status.Status = "Created"
 	sr.Status.AssignedPorts = assigned
+	sr.Status.AssignedIP = targetIP
 	if err := r.Status().Update(ctx, sr); err != nil {
+		if errors.IsConflict(err) {
+			return ctrl.Result{Requeue: true}, nil
+		}
 		return ctrl.Result{}, err
 	}
+
+	logger.Info("ServiceRequest riconciliata con successo",
+		"name", sr.Name,
+		"namespace", sr.Namespace,
+		"assignedPorts", len(sr.Status.AssignedPorts))
 
 	return ctrl.Result{}, nil
 }
 
-// ----------------------------------------------------------------------------
-// Setup with Manager
-// ----------------------------------------------------------------------------
-
+// SetupWithManager configura il controller con il manager
 func (r *ServiceRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1alpha1.ServiceRequest{}).
+		Owns(&corev1.Service{}).
 		Complete(r)
 }
 
