@@ -87,113 +87,129 @@ func (r *ServiceRequestReconciler) getMetalLBIPPool(ctx context.Context) ([]stri
 	}, nil
 }
 
-// findBestIP trova l'IP migliore per le porte richieste
-func (r *ServiceRequestReconciler) findBestIP(ctx context.Context, sr *networkingv1alpha1.ServiceRequest,
-	usedPortsByIP map[string]map[int]bool) (string, []networkingv1alpha1.Service, error) {
-
+// findBestIP trova l'IP migliore per le porte richieste e gestisce l'assegnazione delle porte
+func (r *ServiceRequestReconciler) findBestIPAndAssignPorts(ctx context.Context, sr *networkingv1alpha1.ServiceRequest, usedPortsByIP map[string]map[int]bool) (string, []networkingv1alpha1.Service, error) {
 	logger := log.FromContext(ctx)
 
-	// 1. Prima controlla se esiste un IP già in uso in grado di ospitare tutte le porte richieste
-	for ip, usedPorts := range usedPortsByIP {
-		// Verifica compatibilità
-		compatible := true
-		for _, s := range sr.Spec.Services {
-			if s.Port > 0 && usedPorts[s.Port] {
-				compatible = false
-				logger.Info("IP non compatibile - porta specifica già in uso", "ip", ip, "porta", s.Port)
-				break
-			}
-		}
-
-		if !compatible {
-			continue
-		}
-
-		// Questo IP già in uso è compatibile, assegna le porte
-		logger.Info("Trovato IP esistente compatibile", "ip", ip)
-		assigned := []networkingv1alpha1.Service{}
-		nextPort := basePort
-
-		for _, s := range sr.Spec.Services {
-			port := s.Port
-			if port == 0 {
-				// Trova la prossima porta disponibile
-				for usedPorts[nextPort] {
-					nextPort++
-				}
-				port = nextPort
-				nextPort++
-			}
-
-			assigned = append(assigned, networkingv1alpha1.Service{
-				Name:         s.Name,
-				TargetPort:   s.TargetPort,
-				AssignedPort: port,
-			})
-
-			// Registra questa porta come usata
-			usedPorts[port] = true
-		}
-
-		return ip, assigned, nil
-	}
-
-	// 2. Nessun IP già in uso è compatibile, oppure non ci sono IP in uso, cerca un nuovo IP dal pool
+	// 1. Ottieni il pool di IP disponibili da MetalLB
 	ipPool, err := r.getMetalLBIPPool(ctx)
 	if err != nil {
 		return "", nil, err
 	}
 
-	// Trova il primo IP nel pool che non è già in uso
+	// Crea una copia locale delle porte usate per simulare l'assegnazione
+	simulatedUsedPorts := make(map[string]map[int]bool)
+	for ip, ports := range usedPortsByIP {
+		simulatedUsedPorts[ip] = make(map[int]bool)
+		for port := range ports {
+			simulatedUsedPorts[ip][port] = true
+		}
+	}
+
+	// 2. Suddividi le service ports in quelle con porte specificate e quelle con porte automatiche
+	var specifiedPorts, autoPorts []networkingv1alpha1.Service
+	for _, svcPort := range sr.Spec.Services {
+		if svcPort.Port != 0 {
+			specifiedPorts = append(specifiedPorts, svcPort)
+		} else {
+			autoPorts = append(autoPorts, svcPort)
+		}
+	}
+
+	// Scegli l'IP migliore considerando prima le porte specifiche
+	var bestIP string
+	var allAssignedPorts []networkingv1alpha1.Service
+
+	// 3. Esamina ogni IP disponibile
 	for _, ip := range ipPool {
-		if _, isUsed := usedPortsByIP[ip]; !isUsed {
-			logger.Info("Assegnazione nuovo IP dal pool", "ip", ip)
+		// Inizializza la mappa delle porte se non esiste
+		if simulatedUsedPorts[ip] == nil {
+			simulatedUsedPorts[ip] = make(map[int]bool)
+		}
 
-			assigned := []networkingv1alpha1.Service{}
-			nextPort := basePort
+		// Flag per tracciare se questo IP è compatibile con tutte le porte specificate
+		isIPCompatible := true
 
-			for _, s := range sr.Spec.Services {
-				port := s.Port
-				if port == 0 {
-					port = nextPort
-					nextPort++
-				}
-
-				assigned = append(assigned, networkingv1alpha1.Service{
-					Name:         s.Name,
-					TargetPort:   s.TargetPort,
-					AssignedPort: port,
-				})
+		// 4. Prima verifica se è possibile assegnare tutte le porte specifiche
+		var tempAssignedSpecific []networkingv1alpha1.Service
+		for _, port := range specifiedPorts {
+			// Verifica se la porta richiesta è già in uso
+			if simulatedUsedPorts[ip][port.Port] {
+				isIPCompatible = false
+				logger.Info("Porta specifica già in uso", "ip", ip, "porta", port.Port)
+				break
 			}
 
-			return ip, assigned, nil
+			// Simula l'assegnazione della porta
+			simulatedUsedPorts[ip][port.Port] = true
+			assignedPort := networkingv1alpha1.Service{
+				Name:         port.Name,
+				TargetPort:   port.TargetPort,
+				Port:         port.Port,
+				AssignedPort: port.Port, // Per porte specifiche, AssignedPort = Port
+			}
+			tempAssignedSpecific = append(tempAssignedSpecific, assignedPort)
+		}
+
+		// Se non è compatibile con le porte specifiche, prova il prossimo IP
+		if !isIPCompatible {
+			continue
+		}
+
+		// 5. Ora assegna le porte automatiche
+		var tempAssignedAuto []networkingv1alpha1.Service
+		allAutoPortsAssignable := true
+
+		for _, port := range autoPorts {
+			// Cerca una porta libera nell'intervallo 30000-32767
+			var assignedPort int
+			for potentialPort := 30000; potentialPort <= 32767; potentialPort++ {
+				// Verifica che la porta non sia già in uso o richiesta da altre ServiceRequest
+				if !simulatedUsedPorts[ip][potentialPort] {
+					assignedPort = potentialPort
+					simulatedUsedPorts[ip][potentialPort] = true
+					break
+				}
+			}
+
+			if assignedPort == 0 {
+				// Non è stato possibile trovare una porta libera
+				allAutoPortsAssignable = false
+				logger.Info("Non è possibile trovare una porta libera per l'assegnazione automatica", "ip", ip)
+				break
+			}
+
+			tempAssignedAuto = append(tempAssignedAuto, networkingv1alpha1.Service{
+				Name:         port.Name,
+				TargetPort:   port.TargetPort,
+				Port:         0, // La porta originale è 0 (automatica)
+				AssignedPort: assignedPort,
+			})
+		}
+
+		// 6. Se tutte le porte sono assegnabili, questo è l'IP migliore
+		if allAutoPortsAssignable {
+			bestIP = ip
+			allAssignedPorts = append(tempAssignedSpecific, tempAssignedAuto...)
+			logger.Info("Trovato IP compatibile", "ip", bestIP)
+			break
 		}
 	}
 
-	// 3. Se tutti gli IP del pool sono già in uso, lasciamo che MetalLB ne scelga uno automaticamente
-	/* non ci si dovrebbe mai arrivare, ma lo gestiamo per sicurezza
-	logger.Info("IP pool esaurito, lasciando che MetalLB scelga automaticamente")
-
-	assigned := []networkingv1alpha1.Service{}
-	nextPort := basePort
-
-	for _, s := range sr.Spec.Services {
-		port := s.Port
-		if port == 0 {
-			port = nextPort
-			nextPort++
-		}
-
-		assigned = append(assigned, networkingv1alpha1.Service{
-			Name:         s.Name,
-			TargetPort:   s.TargetPort,
-			AssignedPort: port,
-		})
+	if bestIP == "" {
+		return "", nil, fmt.Errorf("nessun IP disponibile può supportare tutte le porte richieste")
 	}
-	return "", assigned, nil
-	*/
 
-	return "", nil, fmt.Errorf("nessun ip disponibile nel pool")
+	// Aggiorna la mappa reale delle porte utilizzate
+	for _, port := range allAssignedPorts {
+		if usedPortsByIP[bestIP] == nil {
+			usedPortsByIP[bestIP] = make(map[int]bool)
+		}
+		usedPortsByIP[bestIP][port.AssignedPort] = true
+		logger.Info("Porta registrata come in uso", "ip", bestIP, "porta", port.AssignedPort)
+	}
+
+	return bestIP, allAssignedPorts, nil
 }
 
 // Reconcile gestisce la riconciliazione degli oggetti ServiceRequest
@@ -280,7 +296,7 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	// 5. Trova il miglior IP e assegna le porte --------------------------------------------
-	targetIP, assigned, err := r.findBestIP(ctx, sr, usedPortsByIP)
+	targetIP, assigned, err := r.findBestIPAndAssignPorts(ctx, sr, usedPortsByIP)
 	if err != nil {
 		logger.Error(err, "Errore nel trovare un IP adatto")
 		return ctrl.Result{}, err
