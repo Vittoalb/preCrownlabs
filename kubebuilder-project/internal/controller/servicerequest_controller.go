@@ -78,8 +78,8 @@ func (r *ServiceRequestReconciler) updateUsedPortsByIP(ctx context.Context, name
 
 // getMetalLBIPPool ottiene il pool di IP configurato in MetalLB
 func (r *ServiceRequestReconciler) getMetalLBIPPool(ctx context.Context) ([]string, error) {
-	// In un'implementazione reale, dovresti interrogare il ConfigMap di MetalLB
-	// Per ora, restituiamo un pool di IP fisso per semplicità
+	// TODO: Implementa la logica per ottenere il pool di IP da MetalLB dal cluster, interrogare risorsa ConfigMap o MetalLB CRD
+	// Per adesso restituito pool statico di che usiamo tra gli esempi
 	return []string{
 		"172.18.0.240", "172.18.0.241", "172.18.0.242", "172.18.0.243",
 		"172.18.0.244", "172.18.0.245", "172.18.0.246", "172.18.0.247",
@@ -93,7 +93,7 @@ func (r *ServiceRequestReconciler) findBestIP(ctx context.Context, sr *networkin
 
 	logger := log.FromContext(ctx)
 
-	// 1. Prima controlla se esiste un IP esistente in grado di ospitare tutte le porte richieste
+	// 1. Prima controlla se esiste un IP già in uso in grado di ospitare tutte le porte richieste
 	for ip, usedPorts := range usedPortsByIP {
 		// Verifica compatibilità
 		compatible := true
@@ -109,7 +109,7 @@ func (r *ServiceRequestReconciler) findBestIP(ctx context.Context, sr *networkin
 			continue
 		}
 
-		// Questo IP è compatibile, assegna le porte
+		// Questo IP già in uso è compatibile, assegna le porte
 		logger.Info("Trovato IP esistente compatibile", "ip", ip)
 		assigned := []networkingv1alpha1.Service{}
 		nextPort := basePort
@@ -138,7 +138,7 @@ func (r *ServiceRequestReconciler) findBestIP(ctx context.Context, sr *networkin
 		return ip, assigned, nil
 	}
 
-	// 2. Nessun IP esistente è compatibile, cerca un nuovo IP dal pool
+	// 2. Nessun IP già in uso è compatibile, oppure non ci sono IP in uso, cerca un nuovo IP dal pool
 	ipPool, err := r.getMetalLBIPPool(ctx)
 	if err != nil {
 		return "", nil, err
@@ -171,6 +171,7 @@ func (r *ServiceRequestReconciler) findBestIP(ctx context.Context, sr *networkin
 	}
 
 	// 3. Se tutti gli IP del pool sono già in uso, lasciamo che MetalLB ne scelga uno automaticamente
+	/* non ci si dovrebbe mai arrivare, ma lo gestiamo per sicurezza
 	logger.Info("IP pool esaurito, lasciando che MetalLB scelga automaticamente")
 
 	assigned := []networkingv1alpha1.Service{}
@@ -189,8 +190,10 @@ func (r *ServiceRequestReconciler) findBestIP(ctx context.Context, sr *networkin
 			AssignedPort: port,
 		})
 	}
-
 	return "", assigned, nil
+	*/
+
+	return "", nil, fmt.Errorf("nessun ip disponibile nel pool")
 }
 
 // Reconcile gestisce la riconciliazione degli oggetti ServiceRequest
@@ -286,40 +289,105 @@ func (r *ServiceRequestReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// 6. Crea VM se manca ------------------------------------------------------------------
 	runStrategy := kubevirtv1.RunStrategyAlways
 	if !vmExists {
-		vm = &kubevirtv1.VirtualMachine{
-			ObjectMeta: metav1.ObjectMeta{
+		vm := &kubevirtv1.VirtualMachine{
+			ObjectMeta: ctrl.ObjectMeta{
+				//GenerateName: fmt.Sprintf("vm-%s-", serviceRequest.Name), // Usa generateName per creare un nome univoco
 				Name:      sr.Spec.VMName,
 				Namespace: sr.Spec.Namespace,
-				Labels:    map[string]string{"kubevirt.io/domain": sr.Spec.VMName},
 			},
 			Spec: kubevirtv1.VirtualMachineSpec{
-				RunStrategy: &runStrategy,
+				RunStrategy: &runStrategy, // Modifica qui
 				Template: &kubevirtv1.VirtualMachineInstanceTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{
-						Labels: map[string]string{"kubevirt.io/domain": sr.Spec.VMName},
+						Labels: map[string]string{
+							"kubevirt.io/domain": sr.Spec.VMName,
+						},
 					},
 					Spec: kubevirtv1.VirtualMachineInstanceSpec{
 						Domain: kubevirtv1.DomainSpec{
 							Devices: kubevirtv1.Devices{
-								Interfaces: []kubevirtv1.Interface{{
-									Name: "default",
-									InterfaceBindingMethod: kubevirtv1.InterfaceBindingMethod{
-										Masquerade: &kubevirtv1.InterfaceMasquerade{},
+								Disks: []kubevirtv1.Disk{
+									{
+										Name: "containerdisk",
+										DiskDevice: kubevirtv1.DiskDevice{
+											Disk: &kubevirtv1.DiskTarget{
+												Bus: "virtio",
+											},
+										},
 									},
-								}},
+									{
+										Name: "cloudinitdisk",
+										DiskDevice: kubevirtv1.DiskDevice{
+											Disk: &kubevirtv1.DiskTarget{
+												Bus: "virtio",
+											},
+										},
+									},
+								},
+								Interfaces: []kubevirtv1.Interface{
+									{
+										Name: "default",
+										InterfaceBindingMethod: kubevirtv1.InterfaceBindingMethod{
+											Masquerade: &kubevirtv1.InterfaceMasquerade{},
+										},
+									},
+								},
 							},
 							Resources: kubevirtv1.ResourceRequirements{
 								Requests: corev1.ResourceList{
-									corev1.ResourceMemory: resource.MustParse("1024Mi"),
+									corev1.ResourceMemory: resource.MustParse("1024Mi"), // Modifica qui
 								},
 							},
 						},
-						Networks: []kubevirtv1.Network{{
-							Name: "default",
-							NetworkSource: kubevirtv1.NetworkSource{
-								Pod: &kubevirtv1.PodNetwork{},
+						Networks: []kubevirtv1.Network{
+							{
+								Name: "default",
+								NetworkSource: kubevirtv1.NetworkSource{
+									Pod: &kubevirtv1.PodNetwork{},
+								},
 							},
-						}},
+						},
+						Volumes: []kubevirtv1.Volume{
+							{
+								Name: "containerdisk",
+								VolumeSource: kubevirtv1.VolumeSource{
+									ContainerDisk: &kubevirtv1.ContainerDiskSource{
+										Image: "kubevirt/fedora-cloud-container-disk-demo",
+									},
+								},
+							},
+							{
+								Name: "cloudinitdisk",
+								VolumeSource: kubevirtv1.VolumeSource{
+									CloudInitNoCloud: &kubevirtv1.CloudInitNoCloudSource{
+										UserData: `#cloud-config
+package_update: true
+packages:
+  - nginx
+  - openssh-server
+  - openssh-clients
+ssh_pwauth: true
+disable_root: false
+users:
+  - name: fedora
+    groups: sudo
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    lock_passwd: false
+chpasswd:
+  list: |
+    fedora:fedora
+  expire: False
+runcmd:
+  - echo "Ciao mondo" > /usr/share/nginx/html/index.html
+  - systemctl enable sshd
+  - systemctl start sshd
+  - systemctl enable nginx
+  - systemctl start nginx`,
+									},
+								},
+							},
+						},
 					},
 				},
 			},
